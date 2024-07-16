@@ -1,96 +1,73 @@
 import torch
-from torch import nn
-from src.models.base import *
-from typing import Dict, Any
-
-_BASE_CHANNELS = 64
+import torch.nn as nn
+import torch.nn.functional as F
 
 class EVFlowNet(nn.Module):
     def __init__(self, args):
-        super(EVFlowNet,self).__init__()
-        self._args = args
-
-        self.encoder1 = general_conv2d(in_channels = 4, out_channels=_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
-        self.encoder2 = general_conv2d(in_channels = _BASE_CHANNELS, out_channels=2*_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
-        self.encoder3 = general_conv2d(in_channels = 2*_BASE_CHANNELS, out_channels=4*_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
-        self.encoder4 = general_conv2d(in_channels = 4*_BASE_CHANNELS, out_channels=8*_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
-
-        self.resnet_block = nn.Sequential(*[build_resnet_block(8*_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm) for i in range(2)])
-
-        self.decoder1 = upsample_conv2d_and_predict_flow(in_channels=16*_BASE_CHANNELS,
-                        out_channels=4*_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
-
-        self.decoder2 = upsample_conv2d_and_predict_flow(in_channels=8*_BASE_CHANNELS+2,
-                        out_channels=2*_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
-
-        self.decoder3 = upsample_conv2d_and_predict_flow(in_channels=4*_BASE_CHANNELS+2,
-                        out_channels=_BASE_CHANNELS, do_batch_norm=not self._args.no_batch_norm)
-
-        self.decoder4 = upsample_conv2d_and_predict_flow(in_channels=2*_BASE_CHANNELS+2,
-                        out_channels=int(_BASE_CHANNELS/2), do_batch_norm=not self._args.no_batch_norm)
-
-    def forward(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        # encoder
-        skip_connections = {}
-        inputs = self.encoder1(inputs)
-        skip_connections['skip0'] = inputs.clone()
-        inputs = self.encoder2(inputs)
-        skip_connections['skip1'] = inputs.clone()
-        inputs = self.encoder3(inputs)
-        skip_connections['skip2'] = inputs.clone()
-        inputs = self.encoder4(inputs)
-        skip_connections['skip3'] = inputs.clone()
-
-        # transition
-        inputs = self.resnet_block(inputs)
-
-        # decoder
-        flow_dict = {}
-        inputs = torch.cat([inputs, skip_connections['skip3']], dim=1)
-        inputs, flow = self.decoder1(inputs)
-        flow_dict['flow0'] = flow.clone()
-
-        inputs = torch.cat([inputs, skip_connections['skip2']], dim=1)
-        inputs, flow = self.decoder2(inputs)
-        flow_dict['flow1'] = flow.clone()
-
-        inputs = torch.cat([inputs, skip_connections['skip1']], dim=1)
-        inputs, flow = self.decoder3(inputs)
-        flow_dict['flow2'] = flow.clone()
-
-        inputs = torch.cat([inputs, skip_connections['skip0']], dim=1)
-        inputs, flow = self.decoder4(inputs)
-        flow_dict['flow3'] = flow.clone()
-
-        return flow
+        super(EVFlowNet, self).__init__()
+        self.no_batch_norm = args.no_batch_norm
         
+        # エンコーダー
+        self.conv1 = self.conv_layer(4, 64, kernel_size=5, stride=2, padding=2)
+        self.conv2 = self.conv_layer(64, 128, kernel_size=5, stride=2, padding=2)
+        self.conv3 = self.conv_layer(128, 256, kernel_size=5, stride=2, padding=2)
+        self.conv4 = self.conv_layer(256, 256, kernel_size=5, stride=2, padding=2)
+        
+        # デコーダー
+        self.deconv1 = self.deconv_layer(256, 256)
+        self.deconv2 = self.deconv_layer(512, 128)
+        self.deconv3 = self.deconv_layer(256, 64)
+        self.deconv4 = self.deconv_layer(128, 32)
+        
+        # フロー予測
+        self.predict_flow4 = self.predict_flow(256)
+        self.predict_flow3 = self.predict_flow(128)
+        self.predict_flow2 = self.predict_flow(64)
+        self.predict_flow1 = self.predict_flow(32)
 
-# if __name__ == "__main__":
-#     from config import configs
-#     import time
-#     from data_loader import EventData
-#     '''
-#     args = configs()
-#     model = EVFlowNet(args).cuda()
-#     input_ = torch.rand(8,4,256,256).cuda()
-#     a = time.time()
-#     output = model(input_)
-#     b = time.time()
-#     print(b-a)
-#     print(output['flow0'].shape, output['flow1'].shape, output['flow2'].shape, output['flow3'].shape)
-#     #print(model.state_dict().keys())
-#     #print(model)
-#     '''
-#     import numpy as np
-#     args = configs()
-#     model = EVFlowNet(args).cuda()
-#     EventDataset = EventData(args.data_path, 'train')
-#     EventDataLoader = torch.utils.data.DataLoader(dataset=EventDataset, batch_size=args.batch_size, shuffle=True)
-#     #model = nn.DataParallel(model)
-#     #model.load_state_dict(torch.load(args.load_path+'/model18'))
-#     for input_, _, _, _ in EventDataLoader:
-#         input_ = input_.cuda()
-#         a = time.time()
-#         (model(input_))
-#         b = time.time()
-#         print(b-a)
+    def conv_layer(self, in_planes, out_planes, kernel_size=3, stride=1, padding=1):
+        if self.no_batch_norm:
+            return nn.Sequential(
+                nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding, bias=True),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            return nn.Sequential(
+                nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
+                nn.BatchNorm2d(out_planes),
+                nn.ReLU(inplace=True)
+            )
+
+    def deconv_layer(self, in_planes, out_planes):
+        return nn.Sequential(
+            nn.ConvTranspose2d(in_planes, out_planes, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.ReLU(inplace=True)
+        )
+
+    def predict_flow(self, in_planes):
+        return nn.Conv2d(in_planes, 2, kernel_size=3, stride=1, padding=1, bias=True)
+
+    
+    def forward(self, x):
+        # エンコーダー
+        out_conv1 = self.conv1(x)
+        out_conv2 = self.conv2(out_conv1)
+        out_conv3 = self.conv3(out_conv2)
+        out_conv4 = self.conv4(out_conv3)
+
+        # デコーダー
+        out_deconv1 = self.deconv1(out_conv4)
+        concat1 = torch.cat((out_deconv1, out_conv3), 1)
+        out_deconv2 = self.deconv2(concat1)
+        concat2 = torch.cat((out_deconv2, out_conv2), 1)
+        out_deconv3 = self.deconv3(concat2)
+        concat3 = torch.cat((out_deconv3, out_conv1), 1)
+        out_deconv4 = self.deconv4(concat3)
+
+        # マルチスケールフロー予測
+        flow4 = self.predict_flow4(out_deconv1)
+        flow3 = self.predict_flow3(out_deconv2)
+        flow2 = self.predict_flow2(out_deconv3)
+        flow1 = self.predict_flow1(out_deconv4)
+
+        return [flow1, flow2, flow3, flow4]

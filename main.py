@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, Any
 import os
 import time
-
+import torch.nn.functional as F
 
 class RepresentationType(Enum):
     VOXEL = auto()
@@ -36,6 +36,27 @@ def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor):
     epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
     return epe
 
+
+def compute_multiscale_epe_loss(pred_flows, gt_flow):
+    """
+    マルチスケールのEPEロスを計算
+    pred_flows: リスト of torch.Tensor, 各スケールの予測フロー
+    gt_flow: torch.Tensor, 正解のオプティカルフロー
+    """
+    total_loss = 0
+    weights = [0.32, 0.08, 0.02, 0.01]  # 各スケールの重み
+
+    for i, flow in enumerate(pred_flows):
+        # 予測フローを地truthのサイズにリサイズ
+        if flow.shape != gt_flow.shape:
+            flow = F.interpolate(flow, size=gt_flow.shape[2:], mode='bilinear', align_corners=False)
+        
+        # 現在のスケールでのEPE計算
+        epe = torch.norm(flow - gt_flow, p=2, dim=1).mean()
+        total_loss += weights[i] * epe
+
+    return total_loss
+
 def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     '''
     optical flowをnpyファイルに保存
@@ -48,28 +69,6 @@ def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
 def main(args: DictConfig):
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    '''
-        ディレクトリ構造:
-
-        data
-        ├─test
-        |  ├─test_city
-        |  |    ├─events_left
-        |  |    |   ├─events.h5
-        |  |    |   └─rectify_map.h5
-        |  |    └─forward_timestamps.txt
-        └─train
-            ├─zurich_city_11_a
-            |    ├─events_left
-            |    |       ├─ events.h5
-            |    |       └─ rectify_map.h5
-            |    ├─ flow_forward
-            |    |       ├─ 000134.png
-            |    |       |.....
-            |    └─ forward_timestamps.txt
-            ├─zurich_city_11_b
-            └─zurich_city_11_c
-        '''
     
     # ------------------
     #    Dataloader
@@ -84,29 +83,16 @@ def main(args: DictConfig):
     test_set = loader.get_test_dataset()
     collate_fn = train_collate
     train_data = DataLoader(train_set,
-                                 batch_size=args.data_loader.train.batch_size,
-                                 shuffle=args.data_loader.train.shuffle,
-                                 collate_fn=collate_fn,
-                                 drop_last=False)
+                            batch_size=args.data_loader.train.batch_size,
+                            shuffle=args.data_loader.train.shuffle,
+                            collate_fn=collate_fn,
+                            drop_last=False)
     test_data = DataLoader(test_set,
-                                 batch_size=args.data_loader.test.batch_size,
-                                 shuffle=args.data_loader.test.shuffle,
-                                 collate_fn=collate_fn,
-                                 drop_last=False)
+                           batch_size=args.data_loader.test.batch_size,
+                           shuffle=args.data_loader.test.shuffle,
+                           collate_fn=collate_fn,
+                           drop_last=False)
 
-    '''
-    train data:
-        Type of batch: Dict
-        Key: seq_name, Type: list
-        Key: event_volume, Type: torch.Tensor, Shape: torch.Size([Batch, 4, 480, 640]) => イベントデータのバッチ
-        Key: flow_gt, Type: torch.Tensor, Shape: torch.Size([Batch, 2, 480, 640]) => オプティカルフローデータのバッチ
-        Key: flow_gt_valid_mask, Type: torch.Tensor, Shape: torch.Size([Batch, 1, 480, 640]) => オプティカルフローデータのvalid. ベースラインでは使わない
-    
-    test data:
-        Type of batch: Dict
-        Key: seq_name, Type: list
-        Key: event_volume, Type: torch.Tensor, Shape: torch.Size([Batch, 4, 480, 640]) => イベントデータのバッチ
-    '''
     # ------------------
     #       Model
     # ------------------
@@ -116,6 +102,7 @@ def main(args: DictConfig):
     #   optimizer
     # ------------------
     optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate, weight_decay=args.train.weight_decay)
+    
     # ------------------
     #   Start training
     # ------------------
@@ -125,10 +112,10 @@ def main(args: DictConfig):
         print("on epoch: {}".format(epoch+1))
         for i, batch in enumerate(tqdm(train_data)):
             batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
-            ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
-            flow = model(event_image) # [B, 2, 480, 640]
-            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+            event_image = batch["event_volume"].to(device)  # [B, 4, 480, 640]
+            ground_truth_flow = batch["flow_gt"].to(device)  # [B, 2, 480, 640]
+            pred_flows = model(event_image)  # リストを返す [flow1, flow2, flow3, flow4]
+            loss: torch.Tensor = compute_multiscale_epe_loss(pred_flows, ground_truth_flow)
             print(f"batch {i} loss: {loss.item()}")
             optimizer.zero_grad()
             loss.backward()
@@ -149,6 +136,8 @@ def main(args: DictConfig):
     # ------------------
     #   Start predicting
     # ------------------
+    # ------------------
+
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     flow: torch.Tensor = torch.tensor([]).to(device)
@@ -157,9 +146,15 @@ def main(args: DictConfig):
         for batch in tqdm(test_data):
             batch: Dict[str, Any]
             event_image = batch["event_volume"].to(device)
-            batch_flow = model(event_image) # [1, 2, 480, 640]
+            pred_flows = model(event_image)
+            batch_flow = pred_flows[0]  # 最も細かいスケールの予測を使用
+            # 必要に応じて元のサイズにリサイズ
+            if batch_flow.shape[2:] != event_image.shape[2:]:
+                batch_flow = F.interpolate(batch_flow, size=event_image.shape[2:], mode='bilinear', align_corners=False)
             flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
         print("test done")
+    
+
     # ------------------
     #  save submission
     # ------------------

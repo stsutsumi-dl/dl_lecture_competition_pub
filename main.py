@@ -47,7 +47,7 @@ def compute_multiscale_epe_loss(pred_flows, gt_flow):
     weights = [0.32, 0.08, 0.02, 0.01]  # 各スケールの重み
 
     for i, flow in enumerate(pred_flows):
-        # 予測フローを地truthのサイズにリサイズ
+        # 予測フローをtruthのサイズにリサイズ
         if flow.shape != gt_flow.shape:
             flow = F.interpolate(flow, size=gt_flow.shape[2:], mode='bilinear', align_corners=False)
         
